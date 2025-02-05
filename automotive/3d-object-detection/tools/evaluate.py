@@ -53,7 +53,6 @@ def do_eval(det_results, gt_results, CLASSES, cam_sync=False):
     gt_results: dict(id -> det_results)
     CLASSES: dict
     '''
-    assert len(det_results) == len(gt_results)
 
     # 1. calculate iou
     ious = {
@@ -66,6 +65,8 @@ def do_eval(det_results, gt_results, CLASSES, cam_sync=False):
         annos_label = 'annos'
     for id in range(len(gt_results)):
         gt_result = gt_results[id][annos_label]
+        if gt_results[id]['image']['image_idx'] not in det_results:
+            continue
         det_result = det_results[gt_results[id]['image']['image_idx']]
 
         # 1.2, bev iou
@@ -83,8 +84,9 @@ def do_eval(det_results, gt_results, CLASSES, cam_sync=False):
         det_bboxes3d = np.concatenate(
             [det_location, det_dimensions, det_rotation_y[:, None]], axis=-1)
         iou3d_v = iou3d_camera(
-            torch.from_numpy(gt_bboxes3d).cuda(),
-            torch.from_numpy(det_bboxes3d).cuda())
+            torch.from_numpy(gt_bboxes3d).to(
+                "cuda" if torch.cuda.is_available() else "cpu"),
+            torch.from_numpy(det_bboxes3d).to("cuda" if torch.cuda.is_available() else "cpu"))
         ious['bbox_3d'].append(iou3d_v.cpu().numpy())
 
     MIN_IOUS = {
