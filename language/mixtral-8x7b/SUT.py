@@ -26,6 +26,8 @@ from pathlib import Path
 import mlperf_loadgen as lg
 from dataset import Dataset
 
+import re
+
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("Mixtral-8x7B-Instruct-v0.1")
 
@@ -186,6 +188,8 @@ class SUT:
 
         self.num_workers = workers
         self.worker_threads = [None] * self.num_workers
+        # This event is set when any thread encounters an exception.
+        self.exception_event = threading.Event()
         self.query_queue = queue.Queue()
 
         self.use_cached_outputs = use_cached_outputs
@@ -195,7 +199,8 @@ class SUT:
     def start(self):
         # Create worker threads
         for j in range(self.num_workers):
-            worker = threading.Thread(target=self.process_queries)
+            # worker = threading.Thread(target=self.process_queries)
+            worker = threading.Thread(target=self.thread_wrapper, name=f"worker-{j}")
             worker.start()
             self.worker_threads[j] = worker
 
@@ -205,6 +210,16 @@ class SUT:
 
         for worker in self.worker_threads:
             worker.join()
+
+    def thread_wrapper(self):
+        try:
+            self.process_queries()
+        except Exception as e:
+            print(f"Exception in thread {threading.current_thread().name}: {e}")
+            # Signal all threads to stop.
+            self.exception_event.set()
+            # Optionally, you can re-raise if you want to crash immediately.
+            # raise
 
     def process_queries(self):
         """Processor of the queued queries. User may choose to add batching logic"""
@@ -340,6 +355,77 @@ class SUT:
                 else:
                     print(f"\tLoaded from cache: {_p}")
 
+    def print_model_size(self):
+        # Calculate the total number of parameters
+        total_params = sum(p.numel() for p in self.model.parameters())
+        print(f"Total number of parameters: {total_params:,}")
+
+        # Determine bytes per parameter based on the dtype of the first parameter.
+        # This is a rough estimate; if your model uses mixed dtypes, you might want to iterate over all.
+        first_param_dtype = next(self.model.parameters()).dtype
+        if first_param_dtype == torch.float32:
+            bytes_per_param = 4
+        elif first_param_dtype == torch.float16 or first_param_dtype == torch.bfloat16:
+            bytes_per_param = 2
+        elif first_param_dtype == torch.int8:
+            bytes_per_param = 1
+        else:
+            # Default to 4 bytes if unknown
+            bytes_per_param = 4
+
+        # Calculate total size in bytes
+        total_bytes = total_params * bytes_per_param
+        # Convert to gigabytes (1 GB = 1024^3 bytes)
+        total_gb = total_bytes / (1024 ** 3)
+        print(f"Approximate model size (parameters only): {total_gb:.4f} GB")
+
+    def print_model_device_sizes(self):
+        # Dictionary to hold total size per device (in bytes)
+        device_sizes = {}
+        # Dictionary to record which expert IDs are found on each device.
+        # Keys are device strings, values are sets of expert identifiers.
+        expert_devices = {}
+
+        def add_to_device_sizes(name, tensor):
+            dev = str(tensor.device)
+            size_bytes = tensor.numel() * tensor.element_size()
+            # Accumulate the size per device
+            device_sizes[dev] = device_sizes.get(dev, 0) + size_bytes
+
+            # Check if this tensor belongs to an expert module.
+            # This regex looks for "expert.<id>" or "experts.<id>" in the parameter name.
+            match = re.search(r'expert(?:s)?\.(\d+)', name, re.IGNORECASE)
+            if match:
+                expert_id = match.group(1)
+                # Add the expert id to the set for this device.
+                expert_devices.setdefault(dev, set()).add(expert_id)
+
+            # Print the individual tensor information in MB.
+            size_mb = size_bytes / (1024 ** 2)
+            print(f"{name:50s} on {dev:8s} | {size_mb:6.2f} MB")
+
+        print("Parameters:")
+        for name, param in self.model.named_parameters():
+            add_to_device_sizes(name, param)
+
+        print("\nBuffers:")
+        for name, buf in self.model.named_buffers():
+            add_to_device_sizes(name, buf)
+
+        print("\nTotal memory per device:")
+        for dev, size in device_sizes.items():
+            size_gb = size / (1024 ** 3)
+            print(f"Device {dev:8s}: {size_gb:.4f} GB")
+
+        print("\nExpert summary:")
+        if expert_devices:
+            for dev, experts in expert_devices.items():
+                experts_list = sorted(experts, key=lambda x: int(x))
+                print(f"Device {dev:8s}: {len(experts)} experts -> {experts_list}")
+        else:
+            print("No experts found in the model parameters or buffers.")
+
+
     def load_model(self):
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_path,
@@ -348,6 +434,12 @@ class SUT:
             torch_dtype=self.amp_dtype,
         )
         print("Loaded model")
+
+        # Usage example, assuming self.model is already loaded:
+        self.print_model_size()
+
+        # Example usage (assuming model is already loaded):
+        self.print_model_device_sizes()
 
         self.device = torch.device(self.device)
         if self.device == "cpu":
@@ -358,7 +450,9 @@ class SUT:
         self.model.eval()
         try:  # for systems with low ram, the below command gives error as some part is offloaded to disk
             self.model = self.model.to(memory_format=torch.channels_last)
-        except BaseException:
+        except Exception as e:
+            # Catch the exception, print what it gives, and continue.
+            print(f"Warning: Failed to set memory format to torch.channels_last: {e}")
             pass
 
         self.tokenizer = AutoTokenizer.from_pretrained(

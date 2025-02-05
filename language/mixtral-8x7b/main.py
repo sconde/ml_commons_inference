@@ -5,6 +5,7 @@ import os
 import logging
 import sys
 from SUT import SUT, SUTServer
+import json
 
 sys.path.insert(0, os.getcwd())
 
@@ -33,10 +34,7 @@ def get_args():
         default=None,
         help="path to processed validation dataset",
     )
-    parser.add_argument(
-        "--accuracy",
-        action="store_true",
-        help="Run accuracy mode")
+    parser.add_argument("--accuracy", action="store_true", help="Run accuracy mode")
     parser.add_argument(
         "--dtype",
         type=str,
@@ -103,6 +101,27 @@ scenario_map = {
 sut_map = {"offline": SUT, "server": SUTServer}
 
 
+def dump_settings_to_json(settings, filename):
+    settings_dict = {}
+    for attr in dir(settings):
+        # Skip private/internal attributes and methods
+        if attr.startswith("_"):
+            continue
+        value = getattr(settings, attr)
+        # Skip callables
+        if callable(value):
+            continue
+        # Optionally: Skip attributes that you know aren't JSON serializable or convert them appropriately.
+        try:
+            json.dumps(value)
+            settings_dict[attr] = value
+        except (TypeError, OverflowError):
+            settings_dict[attr] = str(value)  # Fallback: convert to string
+    with open(filename, "w") as f:
+        json.dump(settings_dict, f, indent=4)
+    print(f"Settings dumped to {filename}")
+
+
 def main():
     args = get_args()
 
@@ -112,18 +131,29 @@ def main():
     # settings.FromConfig(args.mlperf_conf, "mixtral-8x7b", args.scenario)
     settings.FromConfig(args.user_conf, "mixtral-8x7b", args.scenario)
 
+    settings.min_query_count = args.total_sample_count
+    settings.performance_sample_count_override = args.total_sample_count
+    settings.multi_stream_samples_per_query = args.total_sample_count
+
     if args.accuracy:
         settings.mode = lg.TestMode.AccuracyOnly
     else:
         settings.mode = lg.TestMode.PerformanceOnly
 
+        # Dump settings to JSON file
+
     os.makedirs(args.output_log_dir, exist_ok=True)
+    dump_settings_to_json(settings, os.path.join(args.output_log_dir, "settings.json"))
+
     log_output_settings = lg.LogOutputSettings()
     log_output_settings.outdir = args.output_log_dir
     log_output_settings.copy_summary_to_stdout = True
     log_settings = lg.LogSettings()
     log_settings.log_output = log_output_settings
     log_settings.enable_trace = args.enable_log_trace
+
+    dump_settings_to_json(log_settings, os.path.join(args.output_log_dir, "log_settings.json"))
+
 
     sut_cls = sut_map[args.scenario.lower()]
 
@@ -140,12 +170,7 @@ def main():
     sut.start()
     lgSUT = lg.ConstructSUT(sut.issue_queries, sut.flush_queries)
     log.info("Starting Benchmark run")
-    lg.StartTestWithLogSettings(
-        lgSUT,
-        sut.qsl,
-        settings,
-        log_settings,
-        args.audit_conf)
+    lg.StartTestWithLogSettings(lgSUT, sut.qsl, settings, log_settings, args.audit_conf)
 
     # Stop sut after completion
     sut.stop()
